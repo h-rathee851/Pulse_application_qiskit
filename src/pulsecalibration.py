@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 # Importing standard Qiskit libraries
-from qiskit import IBMQ, assemble
+from qiskit import IBMQ, execute, pulse
 from qiskit.providers.ibmq import IBMQBackend
 from qiskit.pulse import DriveChannel, Schedule, Play
 from qiskit.pulse import library as pulse_lib
@@ -21,8 +21,8 @@ from qiskit.tools.monitor import job_monitor
 from qiskit.providers.exceptions import QiskitBackendNotFoundError, BackendConfigurationError
 
 # Loading your IBM Q account(s)
-IBMQ.load_account()
-provider = IBMQ.get_provider()
+#IBMQ.load_account()
+#provider = IBMQ.get_provider()
 
 
 class PulseCalibration():
@@ -62,7 +62,7 @@ class PulseCalibration():
         if pulse_sigma:
             self._pulse_sigma = pulse_sigma
         else:
-            self._pulse_sigma = 200
+            self._pulse_sigma = 40
         if pulse_dur:
             self._pulse_duration = pulse_dur
         else:
@@ -72,7 +72,6 @@ class PulseCalibration():
         self._pi_amp_ground = pi_amp_ground
         self._pi_amp_excited = pi_amp_excited
         self._state_discriminator_012 = None
-
         # Find out which measurement map index is needed for this qubit
         meas_map_idx = None
         for i, measure_group in enumerate(self._back_config.meas_map):
@@ -151,7 +150,7 @@ class PulseCalibration():
 
     # Prints out relative maxima frequencies in output_data; height gives lower bound (abs val)
     @staticmethod
-    def _rel_maxima(freqs, output_data, height):
+    def _rel_maxima(freqs, output_data, height, distance):
         """Prints out relative maxima frequencies in output_data (can see peaks);
            height gives upper bound (abs val). Be sure to set the height properly or
            the peak will be ignored!
@@ -159,21 +158,21 @@ class PulseCalibration():
             freqs (list): frequency list
             output_data (list): list of resulting signals
             height (float): upper bound (abs val) on a peak
+            width (float): 
         Returns:
             list: List containing relative maxima frequencies
         """
-        peaks, _ = find_peaks(output_data, height)
+        peaks, _ = find_peaks(x=output_data, height=height, distance=distance)
         return freqs[peaks]
 
     def find_freq_ground(self, verbose=False, visual=False):
         """Sets and returns the calibrated frequency corresponding to 0->1 transition."""
         # pylint: disable=too-many-locals
-        sched_list = [self.create_cal_circuit(0.1)]*75
-        freq_list = np.linspace(self._qubit_freq-(20*1e+6), self._qubit_freq+(20*1e+6), 75)
-        sweep_exp = assemble(sched_list, backend=self._backend, meas_level=1,
-                             meas_return='avg', shots=1024,
-                             schedule_los=[{self._drive_chan: freq} for freq in freq_list])
-        sweep_job = self._backend.run(sweep_exp)
+        sched_list = [self.create_cal_circuit(0.5)]*75
+        freq_list = np.linspace(self._qubit_freq-(40*1e+6), self._qubit_freq+(40*1e+6), 75)
+        sweep_job = execute(sched_list, backend=self._backend, meas_level=1, meas_return='avg',
+                            shots=1024, schedule_los = [{self._drive_chan: freq} for freq in freq_list])
+
         if verbose:
             print("Executing the Frequency sweep job for 0->1 transition.")
             job_monitor(sweep_job)
@@ -184,27 +183,39 @@ class PulseCalibration():
             res = sweep_result.get_memory(i)*1e-14
             # Get the results for `qubit` from this experiment
             sweep_values.append(res[self._qubit])
-        scale_factor = 1e+9
-        freq_list_scaled = freq_list/scale_factor
 
+        freq_list_GHz = freq_list/1e+9
+        if visual:
+            print("The frequency-signal plot for frequency sweep: ")
+            plt.scatter(freq_list_GHz, np.real(sweep_values), color='black')
+            plt.xlim([min(freq_list_GHz), max(freq_list_GHz)])
+            plt.xlabel("Frequency [GHz]")
+            plt.ylabel("Measured Signal [a.u.]")
+            plt.show()
+
+        def find_init_params(res_values):
+            est_baseline=np.mean(res_values)
+            est_slope=-5 if est_baseline-np.min(res_values)> 2 else 5
+            return [est_slope, self._qubit_freq/1e9, 1, est_baseline]
+        init_params = find_init_params(np.real(sweep_values))
         # Obtain the optimal paramters that fit the result data.
-        def lorrenzian(xval, scale, q_freq, hwhm, shift):
+        def lorentzian(xval, scale, q_freq, hwhm, shift):
             return (scale / np.pi) * (hwhm / ((xval - q_freq)**2 + hwhm**2)) + shift
-        fit_params, y_fit = self._fit_function(freq_list_scaled,
+        fit_params, y_fit = self._fit_function(freq_list_GHz,
                                                np.real(sweep_values),
-                                               lorrenzian,
-                                               [-5, 4.975, 1, -1]  # init parameters for curve_fit
+                                               lorentzian,
+                                               init_params  # init parameters for curve_fit
                                                )
         if visual:
             print("The frequency-signal plot for frequency sweep: ")
-            plt.scatter(freq_list_scaled, np.real(sweep_values), color='black')
-            plt.plot(freq_list_scaled, y_fit, color='red')
-            plt.xlim([min(freq_list_scaled), max(freq_list_scaled)])
+            plt.scatter(freq_list_GHz, np.real(sweep_values), color='black')
+            plt.plot(freq_list_GHz, y_fit, color='red')
+            plt.xlim([min(freq_list_GHz), max(freq_list_GHz)])
             plt.xlabel("Frequency [GHz]")
             plt.ylabel("Measured Signal [a.u.]")
             plt.show()
         _, qubit_freq_new, _, _ = fit_params
-        self._qubit_freq_ground = qubit_freq_new*scale_factor
+        self._qubit_freq_ground = qubit_freq_new*1e9
         if verbose:
             print(f"The calibrate frequency for the 0->1 transition is {self._qubit_freq_ground}")
         return self._qubit_freq_ground
@@ -216,14 +227,11 @@ class PulseCalibration():
             warn("ground_qubit_freq not computed yet and custom qubit freq not provided." +
                  "Computing ground_qubit_freq now.")
             self._qubit_freq_ground = self.find_freq_ground(verbose, visual)
-        ground_qubit_freq = self._qubit_freq_ground
-        amp_list = np.linspace(0, 0.75, 75)
+        amp_list = np.linspace(0, 0.74, 75)
         rabi_sched_list = [self.create_cal_circuit(amp) for amp in amp_list]
         rabi_list_len = len(rabi_sched_list)
-        rabi_exp = assemble(rabi_sched_list, backend=self._backend, meas_level=1,
-                            meas_return='avg', shots=1024,
-                            schedule_los=[{self._drive_chan: ground_qubit_freq}]*rabi_list_len)
-        rabi_job = self._backend.run(rabi_exp)
+        rabi_job = execute(rabi_sched_list,backend=self._backend, meas_level=1, meas_return='avg', 
+                           shots=1024, schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*len(rabi_sched_list))
         if verbose:
             print("Executing the rabi oscillation job to get Pi pulse for 0->1 transition.")
             job_monitor(rabi_job)
@@ -236,26 +244,25 @@ class PulseCalibration():
 
         rabi_values = np.real(self._baseline_remove(rabi_values))
 
-        def cos_curve(xval, scale, shift, drive_period, phi):
-            return scale*np.cos(2*np.pi*xval/drive_period - phi) + shift
         # Obtain the optimal paramters that fit the result data.
         fit_params, y_fit = self._fit_function(amp_list,
                                                rabi_values,
-                                               cos_curve,
-                                               [3, 0.1, 0.5, 0])
+                                               lambda x, A, B, drive_period, phi: (A*np.sin(2*np.pi*x/drive_period - phi) + B),
+                                               [3e-7, 0, 0.3, 0])
         drive_period = fit_params[2]
         self._pi_amp_ground = drive_period/2
         if verbose:
             print(f"The Pi amplitude of 0->1 transition is {self._pi_amp_ground}.")
         if visual:
             print("The amplitude-signal plot for rabi oscillation for 0->1 transition.")
+            plt.figure()
             plt.scatter(amp_list, rabi_values, color='black')
             plt.plot(amp_list, y_fit, color='red')
             plt.axvline(drive_period/2, color='red', linestyle='--')
             plt.axvline(drive_period, color='red', linestyle='--')
             plt.annotate("", xy=(drive_period, 0), xytext=(drive_period/2, 0),
                          arrowprops=dict(arrowstyle="<->", color='red'))
-            plt.annotate("$\\pi$", xy=(drive_period/2-0.03, 0.1), color='red')
+            #plt.annotate("$\pi$", xy=(drive_period/2-0.03, 0.1), color='red')
 
             plt.xlabel("Drive amp [a.u.]", fontsize=15)
             plt.ylabel("Measured signal [a.u.]", fontsize=15)
@@ -275,63 +282,46 @@ class PulseCalibration():
         base_pulse = pulse_lib.gaussian(duration=self._pulse_duration,
                                         sigma=self._pulse_sigma, amp=0.3)
         sched_list = []
-        excited_freq_list = self._qubit_freq_ground + np.linspace(-400*1e+6, 30*1e+6, 75)
+        # Here we assume that the anharmocity is about 8% for all qubits.
+        excited_freq_list = self._qubit_freq_ground-0.33e9 + np.linspace(-100*1e+6, 100*1e+6, 75)
         for freq in excited_freq_list:
             sched_list.append(self.create_cal_circuit_excited(base_pulse, freq))
-        excited_sweep_exp = assemble(sched_list, backend=self._backend,
-                                     meas_level=1, meas_return='avg', shots=1024,
-                                     schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*75
-                                     )
-        excited_sweep_job = self._backend.run(excited_sweep_exp)
+        excited_sweep_job = execute(sched_list, backend=self._backend, 
+                                    meas_level=1, meas_return='avg', shots=1024,
+                                    schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*len(excited_freq_list)
+                                    )
         if verbose:
-            print("Executing the coarse Frequency sweep job for 1->2 transition.")
+            print("Executing the Frequency sweep job for 1->2 transition.")
             job_monitor(excited_sweep_job)
         excited_sweep_data = self.get_job_data(excited_sweep_job, average=True)
         if visual:
-            print("The frequency-signal plot of coarse frequency sweep for 1->2 transition : ")
+            print("The frequency-signal plot of frequency sweep for 1->2 transition.")
             # Note: we are only plotting the real part of the signal
             plt.scatter(excited_freq_list/1e+9, excited_sweep_data, color='black')
-            plt.xlim([min(excited_freq_list/1e+9)+0.01, max(excited_freq_list/1e+9)])
+            plt.xlim([min(excited_freq_list/1e+9), max(excited_freq_list/1e+9)])
             plt.xlabel("Frequency [GHz]", fontsize=15)
             plt.ylabel("Measured Signal [a.u.]", fontsize=15)
-            plt.title("1->2 Frequency Sweep (first pass)", fontsize=15)
+            plt.title("1->2 Frequency Sweep", fontsize=15)
             plt.show()
-        approx_12_freq = self._rel_maxima(excited_freq_list, np.real(excited_sweep_data), 1)
-
-        refined_freq_list = approx_12_freq + np.linspace(-20*1e+6, 20*1e+6, 75)
-        refined_sched_list = []
-        for freq in refined_freq_list:
-            refined_sched_list.append(self.create_cal_circuit_excited(base_pulse, freq))
-        refined_sweep_exp = assemble(refined_sched_list, backend=self._backend,
-                                     meas_level=1, meas_return='avg', shots=1024,
-                                     schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*75
-                                     )
-        refined_sweep_job = self._backend.run(refined_sweep_exp)
-        if verbose:
-            print("Executing the refined Frequency sweep job for 1->2 transition.")
-            job_monitor(refined_sweep_job)
-        refined_sweep_data = self.get_job_data(refined_sweep_job, average=True)
-
-        def lorrenzian(xval, scale, q_freq, hwhm, shift):
+        def lorentzian(xval, scale, q_freq, hwhm, shift):
             return (scale / np.pi) * (hwhm / ((xval - q_freq)**2 + hwhm**2)) + shift
         # do fit in Hz
-        (refined_sweep_fit_params,
-         refined_sweep_y_fit) = self._fit_function(refined_freq_list,
-                                                   refined_sweep_data,
-                                                   lorrenzian,
-                                                   [-12, 4.625*1e+9, 0.05*1e+9, 1*1e+9]
+        excited_sweep_fit_params, excited_sweep_y_fit = self._fit_function(excited_freq_list,
+                                                   excited_sweep_data,
+                                                   lorentzian,
+                                                   [12, self._qubit_freq_ground*0.92, 0.05*1e+9, 1e-7]
                                                    )
         if visual:
-            print("The frequency-signal plot of refined frequency sweep for 1->2 transition.")
+            print("The frequency-signal plot of frequency sweep for 1->2 transition.")
             # Note: we are only plotting the real part of the signal
-            plt.scatter(refined_freq_list/1e+9, refined_sweep_data, color='black')
-            plt.plot(refined_freq_list/1e+9, refined_sweep_y_fit, color='red')
-            plt.xlim([min(refined_freq_list/1e+9), max(refined_freq_list/1e+9)])
+            plt.scatter(excited_freq_list/1e+9, excited_sweep_data, color='black')
+            plt.plot(excited_freq_list/1e+9, excited_sweep_y_fit, color='red')
+            plt.xlim([min(excited_freq_list/1e+9), max(excited_freq_list/1e+9)])
             plt.xlabel("Frequency [GHz]", fontsize=15)
             plt.ylabel("Measured Signal [a.u.]", fontsize=15)
-            plt.title("1->2 Frequency Sweep (refined pass)", fontsize=15)
+            plt.title("1->2 Frequency Sweep", fontsize=15)
             plt.show()
-        _, qubit_freq_12, _, _ = refined_sweep_fit_params
+        _, qubit_freq_12, _, _ = excited_sweep_fit_params
         self._qubit_freq_excited = qubit_freq_12
         if verbose:
             print(f"The calibrated frequency for the 1->2 transition\
@@ -351,29 +341,35 @@ class PulseCalibration():
                                             sigma=self._pulse_sigma, amp=amp)
             rabi_sched_list.append(self.create_cal_circuit_excited(base_pulse,
                                    self._qubit_freq_excited))
-        rabi_exp = assemble(rabi_sched_list, backend=self._backend,
+        rabi_job = execute(rabi_sched_list, backend=self._backend,
                             meas_level=1, meas_return='avg', shots=1024,
                             schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*75
                             )
-        rabi_job = self._backend.run(rabi_exp)
         if verbose:
             print("Executing the rabi oscillation job for 1->2 transition.")
             job_monitor(rabi_job)
         rabi_data = self.get_job_data(rabi_job, average=True)
         rabi_data = np.real(self._baseline_remove(rabi_data))
+        if visual:
+            print("The amplitude-signal plot of rabi oscillation for 1->2 transition.")
+            plt.figure()
+            plt.scatter(amp_list, rabi_data, color='black')
+            plt.xlabel("Drive amp [a.u.]", fontsize=15)
+            plt.ylabel("Measured signal [a.u.]", fontsize=15)
+            plt.title('Rabi Experiment (1->2)', fontsize=20)
+            plt.show()
 
-        def cos_curve(xval, scale, shift, drive_period, phi):
-            return scale*np.cos(2*np.pi*xval/drive_period - phi) + shift
         (rabi_fit_params,
          rabi_y_fit) = self._fit_function(amp_list,
                                           rabi_data,
-                                          cos_curve,
-                                          [3, 0.5, 0.9, 0])
+                                          lambda x, A, B, drive_period, phi: (A*np.cos(2*np.pi*x/drive_period - phi) + B),
+                                          [3e-8, 0, 0.4, np.pi/2])
         drive_period_excited = rabi_fit_params[2]
         pi_amp_excited = (drive_period_excited/2/np.pi) * (np.pi+rabi_fit_params[3])
         self._pi_amp_excited = pi_amp_excited
         if visual:
             print("The amplitude-signal plot of rabi oscillation for 1->2 transition.")
+            plt.figure()
             plt.scatter(amp_list, rabi_data, color='black')
             plt.plot(amp_list, rabi_y_fit, color='red')
             # account for phi in computing pi amp
@@ -383,7 +379,7 @@ class PulseCalibration():
             plt.annotate("", xy=(self._pi_amp_excited+drive_period_excited/2, 0),
                          xytext=(self._pi_amp_excited, 0),
                          arrowprops=dict(arrowstyle="<->", color='red'))
-            plt.annotate("$\\pi$", xy=(self._pi_amp_excited-0.03, 0.1), color='red')
+            #plt.annotate("$\\pi$", xy=(self._pi_amp_excited-0.03, 0.1), color='red')
 
             plt.xlabel("Drive amp [a.u.]", fontsize=15)
             plt.ylabel("Measured signal [a.u.]", fontsize=15)
@@ -401,6 +397,18 @@ class PulseCalibration():
         """Returns a pi pulse of the 1->2 transition."""
         pulse = pulse_lib.gaussian(duration=self._pulse_duration, sigma=self._pulse_sigma,
                                    amp=self._pi_amp_excited)
+        excited_pulse = self.apply_sideband(pulse, self._qubit_freq_excited)
+        return excited_pulse
+
+    def get_x90_pulse_ground(self):
+        """Returns a pi/2 pulse of the 0->1 transition."""
+        pulse = pulse_lib.gaussian(duration=self._pulse_duration,
+                                   sigma=self._pulse_sigma, amp=self._pi_amp_ground/2)
+        return pulse
+    def get_x90_pulse_excited(self):
+        """Returns a pi/2 pulse of the 1->2 transition."""
+        pulse = pulse_lib.gaussian(duration=self._pulse_duration, sigma=self._pulse_sigma,
+                                   amp=self._pi_amp_excited/2)
         excited_pulse = self.apply_sideband(pulse, self._qubit_freq_excited)
         return excited_pulse
 
@@ -491,11 +499,10 @@ class PulseCalibration():
         zero_sched = self.get_zero_sched()
         one_sched = self.get_one_sched()
         two_sched = self.get_two_sched()
-        iq_exp = assemble([zero_sched, one_sched, two_sched], backend=self._backend,
+        iq_job = execute([zero_sched, one_sched, two_sched], backend=self._backend,
                           meas_level=1, meas_return='single', shots=1024,
                           schedule_los=[{self._drive_chan: self._qubit_freq_ground}]*3
                           )
-        iq_job = self._backend.run(iq_exp)
         if verbose:
             job_monitor(iq_job)
         iq_data = self.get_job_data(iq_job, average=False)
@@ -571,3 +578,124 @@ class PulseCalibration():
         excited_amp = self.find_pi_amp_excited(verbose, visual)
         state_discriminator = self.find_three_level_discriminator(verbose, visual)
         return ground_freq, ground_amp, excited_freq, excited_amp, state_discriminator
+    def T1_ground(self, verbose=False, visual=False):
+        """Returns the T1 of 1 state"""
+        time_max=600
+        time_step=8
+        times=np.arange(1,time_max,time_step)*1e-6
+        
+        delay_times_dt=times/self._dt
+
+        t1_gnd_sched=[]
+        for delay in delay_times_dt:
+            this_sched= Schedule(name=f"T1 delay={delay*self._dt/1e-6} us")
+            this_sched+= Play(self.get_pi_pulse_ground(),self._drive_chan)
+            this_sched|=self._measure<<int(delay)
+            t1_gnd_sched.append(this_sched)
+        #sched_idx=0
+        #t1_gnd_sched[sched_idx]
+        # Execution settings
+        t1_gnd_job = execute(t1_gnd_sched, backend=self._backend, meas_level=1,
+                             meas_return='avg', shots=256,
+                             schedule_los=[{self._drive_chan: self.get_qubit_freq_ground()}] 
+                             * len(t1_gnd_sched))
+        if verbose:
+            job_monitor(t1_gnd_job)
+        t1_gnd_results =self.get_job_data(t1_gnd_job, average=True)
+        t1_gnd_results = np.real(t1_gnd_results)
+        # Fit the data
+        fit_params, y_fit = self._fit_function(times, t1_gnd_results, 
+        lambda x, A, C, T1: (A * np.exp(-x / T1) + C),[-6, 8, 100*1e-6])
+
+        _, _, T1_gnd = fit_params
+        if visual:
+            plt.scatter(times*1e6, t1_gnd_results, color='black')
+            plt.plot(times*1e6, y_fit, color='red', label=f"T1 = {T1_gnd*1e6:.2f} us")
+            plt.xlim(0, np.max(times)*1e6)
+            plt.title("$T_1$ Experiment", fontsize=15)
+            plt.xlabel('Delay before measurement [$\mu$s]', fontsize=15)
+            plt.ylabel('Signal [a.u.]', fontsize=15)
+            plt.legend()
+            plt.show()
+        return T1_gnd
+    def T1_excited(self, verbose=False, visual=False):
+        """Returns the T1 of 2 state"""
+        time_max=600
+        time_step=8
+        times=np.arange(1,time_max,time_step)*1e-6
+        
+        delay_times_dt=times/self._dt
+
+        t1_exc_sched=[]
+        for delay in delay_times_dt:
+            this_sched= Schedule(name=f"T1 delay={delay*self._dt/1e-6} us")
+            this_sched+= Play(self.get_pi_pulse_ground(),self._drive_chan)
+            this_sched += Play(self.get_pi_pulse_excited(), self._drive_chan)
+            this_sched|=self._measure<<int(delay)
+            t1_exc_sched.append(this_sched)
+        #sched_idx=0
+        #t1_gnd_sched[sched_idx]
+        # Execution settings
+        t1_exc_job = execute(t1_exc_sched, backend=self._backend, meas_level=1,
+                             meas_return='avg', shots=256,
+                             schedule_los=[{self._drive_chan: self.get_qubit_freq_ground()}] 
+                             * len(t1_exc_sched))
+        if verbose:
+            job_monitor(t1_exc_job)
+        t1_exc_results =self.get_job_data(t1_exc_job, average=True)
+        t1_exc_results = np.real(t1_exc_results) # Reverse the sign to have a decay behavior.
+        # Fit the data
+        fit_params, y_fit = self._fit_function(times, t1_exc_results, lambda x, A, C, T1: (A * np.exp(-x / T1) + C),[-6, 8, 100*1e-6])
+
+        _, _, T1_exc = fit_params
+        if visual:
+            plt.scatter(times*1e6, t1_exc_results, color='black')
+            plt.plot(times*1e6, y_fit, color='red', label=f"T1 = {T1_exc*1e6:.2f} us")
+            plt.xlim(0, np.max(times)*1e6)
+            plt.title("$T_1$ Experiment", fontsize=15)
+            plt.xlabel('Delay before measurement [$\mu$s]', fontsize=15)
+            plt.ylabel('Signal [a.u.]', fontsize=15)
+            plt.legend()
+            plt.show()
+        return T1_exc
+    def T2_ground(self,verbose=False,visual=False):
+        """Returns the T2 of 1 state"""
+        time_max=300
+        time_step=4
+        times=np.arange(2,time_max,time_step)*1e-6
+        
+        delay_times_dt=times/self._dt
+
+        t2_gnd_sched=[]
+        for delay in delay_times_dt:
+            this_sched= Schedule(name=f"T2 delay={delay*self._dt/1e-6} us")
+            this_sched|= Play(self.get_x90_pulse_ground(),self._drive_chan)
+            this_sched|= Play(self.get_pi_pulse_ground(),self._drive_chan) << int(this_sched.duration+delay)
+            this_sched|= Play(self.get_x90_pulse_ground(),self._drive_chan)<< int(this_sched.duration+delay)
+            this_sched|=self._measure<<int(this_sched.duration)
+            t2_gnd_sched.append(this_sched)
+        #sched_idx=0
+        #t1_gnd_sched[sched_idx]
+        # Execution settings
+        t2_gnd_job = execute(t2_gnd_sched, backend=self._backend, meas_level=1,
+                             meas_return='avg', shots=512,
+                             schedule_los=[{self._drive_chan: self.get_qubit_freq_ground()}] 
+                             * len(t2_gnd_sched))
+        if verbose:
+            job_monitor(t2_gnd_job)
+        t2_gnd_results =self.get_job_data(t2_gnd_job, average=True)
+        t2_gnd_results = np.real(t2_gnd_results)
+        # Fit the data2
+        fit_params, y_fit = self._fit_function(2*times, t2_gnd_results, lambda x, A, C, T2: (A * np.exp(-x / T2) + C),[-3, 0, 100*1e-6])
+
+        _, _, T2_gnd = fit_params
+        if visual:
+            plt.scatter(2*times*1e6, t2_gnd_results, color='black')
+            plt.plot(2*times*1e6, y_fit, color='red', label=f"T2 = {T2_gnd*1e6:.2f} us")
+            plt.xlim(0, np.max(2*times)*1e6)
+            plt.title("$T_2$ Experiment with Hahn Echo", fontsize=15)
+            plt.xlabel('Delay before measurement [$\mu$s]', fontsize=15)
+            plt.ylabel('Signal [a.u.]', fontsize=15)
+            plt.legend()
+            plt.show()
+        return T2_gnd
